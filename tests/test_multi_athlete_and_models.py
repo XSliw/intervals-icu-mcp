@@ -7,6 +7,11 @@ import pytest
 from httpx import Response
 
 from intervals_icu_mcp.tools.activities import get_recent_activities, search_activities
+from intervals_icu_mcp.tools.athlete import (
+    get_athlete_profile,
+    get_fitness_chart,
+    get_fitness_summary,
+)
 from intervals_icu_mcp.tools.event_management import (
     bulk_create_events,
     bulk_delete_events,
@@ -16,6 +21,11 @@ from intervals_icu_mcp.tools.event_management import (
     update_event,
 )
 from intervals_icu_mcp.tools.events import get_calendar_events, get_event, get_upcoming_workouts
+from intervals_icu_mcp.tools.wellness import (
+    get_wellness_data,
+    get_wellness_for_date,
+    update_wellness,
+)
 
 # ==================== Fixtures ====================
 
@@ -27,6 +37,15 @@ def make_ctx(config):
 
 
 COACH_ATHLETE = "i999888"
+
+
+def _patch_direct_config(monkeypatch, mod, config):
+    """gear.py and sport_settings.py bypass the middleware and call load_config()
+    themselves; validate_credentials() also rejects the fixture's placeholder
+    athlete id, so both have to be patched for those modules."""
+    if hasattr(mod, "load_config"):
+        monkeypatch.setattr(mod, "load_config", lambda: config)
+        monkeypatch.setattr(mod, "validate_credentials", lambda _c: True)
 
 
 # ==================== Multi-athlete: Activities ====================
@@ -76,6 +95,234 @@ class TestMultiAthleteActivities:
             respx_mock.calls.last.request.url.path
             == f"/api/v1/athlete/{COACH_ATHLETE}/activities/search"
         )
+
+
+# ==================== Multi-athlete: Fitness / Wellness ====================
+
+
+class TestMultiAthleteFitness:
+    """Test athlete_id passthrough on the fitness/fatigue/form (CTL/ATL/TSB) tools.
+
+    Regression guard for #99: these tools previously exposed no athlete_id at all,
+    so a coach's request silently returned the default profile's numbers.
+    """
+
+    async def test_get_fitness_summary_with_athlete_id(
+        self, mock_config, respx_mock, mock_wellness_data
+    ):
+        from datetime import date
+
+        today = date.today().isoformat()
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}/wellness/{today}").mock(
+            return_value=Response(200, json={**mock_wellness_data, "id": today, "ctl": 71.0})
+        )
+
+        result = await get_fitness_summary(athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config))
+        response = json.loads(result)
+
+        assert response["data"]["fitness_metrics"]["ctl"]["value"] == 71.0
+        # The response must name whose numbers these are — the #99 failure was
+        # undetectable precisely because it never did.
+        assert response["data"]["athlete_id"] == COACH_ATHLETE
+        assert (
+            respx_mock.calls.last.request.url.path
+            == f"/api/v1/athlete/{COACH_ATHLETE}/wellness/{today}"
+        )
+
+    async def test_fitness_summary_no_data_names_the_athlete(self, mock_config, respx_mock):
+        """The no-data message must not tell a coach to go do the athlete's training."""
+        from datetime import date
+
+        today = date.today().isoformat()
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}/wellness/{today}").mock(
+            return_value=Response(200, json={"id": today})
+        )
+
+        result = await get_fitness_summary(athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config))
+        response = json.loads(result)
+
+        assert response["error"]["type"] == "no_data"
+        assert COACH_ATHLETE in response["error"]["message"]
+        assert "Complete some activities" not in response["error"]["message"]
+
+    async def test_get_fitness_summary_default_athlete(
+        self, mock_config, respx_mock, mock_wellness_data
+    ):
+        """Without athlete_id, uses the configured default."""
+        from datetime import date
+
+        today = date.today().isoformat()
+        respx_mock.get(f"/athlete/i123456/wellness/{today}").mock(
+            return_value=Response(200, json={**mock_wellness_data, "id": today})
+        )
+
+        result = await get_fitness_summary(ctx=make_ctx(mock_config))
+        response = json.loads(result)
+        assert response["data"]["athlete_id"] == "i123456"
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/i123456/wellness/{today}"
+
+    async def test_get_athlete_profile_with_athlete_id(
+        self, mock_config, respx_mock, mock_athlete_data
+    ):
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}").mock(
+            return_value=Response(
+                200, json={**mock_athlete_data, "id": COACH_ATHLETE, "name": "Coached Athlete"}
+            )
+        )
+
+        result = await get_athlete_profile(athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config))
+        response = json.loads(result)
+
+        assert response["data"]["profile"]["id"] == COACH_ATHLETE
+        assert response["data"]["profile"]["name"] == "Coached Athlete"
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/{COACH_ATHLETE}"
+
+    async def test_get_athlete_profile_default_athlete(
+        self, mock_config, respx_mock, mock_athlete_data
+    ):
+        respx_mock.get("/athlete/i123456").mock(return_value=Response(200, json=mock_athlete_data))
+
+        result = await get_athlete_profile(ctx=make_ctx(mock_config))
+        response = json.loads(result)
+
+        assert response["data"]["profile"]["id"] == "i123456"
+        assert respx_mock.calls.last.request.url.path == "/api/v1/athlete/i123456"
+
+    async def test_get_fitness_chart_with_athlete_id(self, mock_config, respx_mock):
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}/wellness").mock(
+            return_value=Response(200, json=[])
+        )
+
+        result = await get_fitness_chart(
+            days_back=7, days_ahead=0, athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config)
+        )
+        response = json.loads(result)
+
+        assert response["data"]["count"] == 0
+        assert response["data"]["athlete_id"] == COACH_ATHLETE
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/{COACH_ATHLETE}/wellness"
+
+
+class TestMultiAthleteWellness:
+    """Test athlete_id passthrough on wellness tools (records carry CTL/ATL)."""
+
+    async def test_get_wellness_data_with_athlete_id(self, mock_config, respx_mock):
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}/wellness").mock(
+            return_value=Response(200, json=[])
+        )
+
+        result = await get_wellness_data(
+            days_back=7, athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config)
+        )
+        json.loads(result)
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/{COACH_ATHLETE}/wellness"
+
+    async def test_get_wellness_for_date_with_athlete_id(
+        self, mock_config, respx_mock, mock_wellness_data
+    ):
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}/wellness/2026-04-20").mock(
+            return_value=Response(200, json={**mock_wellness_data, "id": "2026-04-20"})
+        )
+
+        result = await get_wellness_for_date(
+            date="2026-04-20", athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config)
+        )
+        json.loads(result)
+        assert (
+            respx_mock.calls.last.request.url.path
+            == f"/api/v1/athlete/{COACH_ATHLETE}/wellness/2026-04-20"
+        )
+
+    async def test_update_wellness_with_athlete_id(
+        self, mock_config, respx_mock, mock_wellness_data
+    ):
+        """Writes must land on the coached athlete, not the authenticated one."""
+        respx_mock.put(f"/athlete/{COACH_ATHLETE}/wellness").mock(
+            return_value=Response(200, json={**mock_wellness_data, "id": "2026-04-20"})
+        )
+
+        result = await update_wellness(
+            date="2026-04-20", hrv=68.0, athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config)
+        )
+        json.loads(result)
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/{COACH_ATHLETE}/wellness"
+
+
+# ==================== Multi-athlete: remaining read surface ====================
+
+
+class TestMultiAthleteRemainingReads:
+    """athlete_id passthrough on curves, sport settings, gear, library and search.
+
+    Covers the tools closed out by #101. Each asserts the request path, since a
+    silently-dropped parameter still returns a valid-looking 200.
+    """
+
+    @pytest.mark.parametrize(
+        "tool_path,func_name,route,kwargs",
+        [
+            ("performance", "get_power_curves", "power-curves", {}),
+            ("curves", "get_hr_curves", "hr-curves", {}),
+            ("curves", "get_pace_curves", "pace-curves", {}),
+            ("sport_settings", "get_sport_settings", "sport-settings", {}),
+            ("gear", "get_gear_list", "gear", {}),
+            ("workout_library", "get_workout_library", "folders", {}),
+            ("workout_library", "get_workouts_in_folder", "workouts", {"folder_id": 1}),
+            ("activities", "search_activities_full", "activities/search-full", {"query": "x"}),
+            ("activities", "get_activities_around", "activities-around", {"activity_id": "a1"}),
+        ],
+    )
+    async def test_read_tool_routes_to_requested_athlete(
+        self, mock_config, respx_mock, monkeypatch, tool_path, func_name, route, kwargs
+    ):
+        import importlib
+
+        mod = importlib.import_module(f"intervals_icu_mcp.tools.{tool_path}")
+        func = getattr(mod, func_name)
+        # gear.py and sport_settings.py read credentials via load_config() instead of
+        # the middleware-injected ctx state, so mock_config alone does not reach them.
+        _patch_direct_config(monkeypatch, mod, mock_config)
+
+        respx_mock.get(f"/athlete/{COACH_ATHLETE}/{route}").mock(
+            return_value=Response(200, json=[])
+        )
+
+        await func(athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config), **kwargs)
+
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/{COACH_ATHLETE}/{route}"
+
+    async def test_gear_write_routes_to_requested_athlete(
+        self, mock_config, respx_mock, monkeypatch
+    ):
+        """Writes must land on the coached athlete, not the authenticated one."""
+        from intervals_icu_mcp.tools import gear
+
+        _patch_direct_config(monkeypatch, gear, mock_config)
+        respx_mock.put(f"/athlete/{COACH_ATHLETE}/gear/b1").mock(
+            return_value=Response(200, json={"id": "b1", "name": "Bike"})
+        )
+
+        await gear.update_gear(
+            gear_id="b1", name="Bike", athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config)
+        )
+
+        assert respx_mock.calls.last.request.url.path == f"/api/v1/athlete/{COACH_ATHLETE}/gear/b1"
+
+    async def test_sport_settings_write_routes_to_requested_athlete(
+        self, mock_config, respx_mock, monkeypatch
+    ):
+        from intervals_icu_mcp.tools import sport_settings
+
+        _patch_direct_config(monkeypatch, sport_settings, mock_config)
+        respx_mock.put(f"/athlete/{COACH_ATHLETE}/sport-settings/7").mock(
+            return_value=Response(200, json={"id": 7, "types": ["Ride"], "ftp": 260})
+        )
+
+        await sport_settings.update_sport_settings(
+            sport_id=7, ftp=260, athlete_id=COACH_ATHLETE, ctx=make_ctx(mock_config)
+        )
+
+        assert COACH_ATHLETE in respx_mock.calls.last.request.url.path
 
 
 # ==================== Multi-athlete: Events ====================

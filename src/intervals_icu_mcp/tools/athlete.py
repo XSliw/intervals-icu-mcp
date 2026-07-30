@@ -62,16 +62,129 @@ def _fitness_chart_summary(series: list[dict[str, Any]], today: date) -> dict[st
     return summary
 
 
-async def get_athlete_profile(
+def _athlete_access(record: dict[str, Any], is_default: bool) -> tuple[str, bool]:
+    """Map the API's relationship fields onto a plain access label.
+
+    `icu_permission` is NONE/READ/WRITE, and is null for the caller's own record.
+    """
+    if is_default:
+        return "self", True
+    permission = record.get("icu_permission")
+    if record.get("icu_coach") or permission == "WRITE":
+        return "coach", True
+    if permission == "READ":
+        return "follower", False
+    if permission == "NONE":
+        return "none", False
+    # No permission field and not the configured default: the caller's own
+    # record under a different id (e.g. a stale INTERVALS_ICU_ATHLETE_ID).
+    return "self", True
+
+
+async def list_athletes(
     ctx: Context | None = None,
 ) -> str:
-    """Get the authenticated athlete's profile — sport settings (outdoor/indoor FTP, FTHR, pace) and current CTL/ATL/TSB."""
+    """List the athletes this account can access — the caller plus anyone they follow or coach.
+
+    Call this FIRST whenever a request concerns someone other than the default
+    athlete, to resolve a name to the athlete_id that other tools take. Returns
+    each athlete's access level, so you know before calling whether a write will
+    be permitted.
+    """
     assert ctx is not None
     config: ICUConfig = await ctx.get_state("config")
 
     try:
         async with ICUClient(config) as client:
-            athlete = await client.get_athlete()
+            records = await client.list_athletes()
+
+            default_id = config.intervals_icu_athlete_id
+            athletes: list[dict[str, Any]] = []
+            for record in records:
+                athlete_id = record.get("id")
+                if not athlete_id:
+                    continue
+                is_default = athlete_id == default_id
+                access, can_write = _athlete_access(record, is_default)
+                entry: dict[str, Any] = {
+                    "athlete_id": athlete_id,
+                    "name": record.get("name"),
+                    "access": access,
+                    "can_write": can_write,
+                }
+                if is_default:
+                    entry["is_default"] = True
+                if record.get("icu_tags"):
+                    entry["tags"] = record["icu_tags"]
+                athletes.append(entry)
+
+            # Default athlete first, then alphabetical — a coach's own account is
+            # the most common target and should not be buried in a long roster.
+            athletes.sort(key=lambda a: (not a.get("is_default", False), (a["name"] or "").lower()))
+
+            if not athletes:
+                return ResponseBuilder.build_response(
+                    data={"athletes": [], "count": 0, "default_athlete_id": default_id},
+                    metadata={
+                        "message": (
+                            "No athletes returned. This account follows or coaches no one, "
+                            "so only the default athlete is available."
+                        )
+                    },
+                    query_type="athlete_list",
+                )
+
+            return ResponseBuilder.build_response(
+                data={
+                    "athletes": athletes,
+                    "count": len(athletes),
+                    "default_athlete_id": default_id,
+                },
+                metadata={
+                    "access_levels": (
+                        "self = this account; coach = read and write; "
+                        "follower = read only; none = no access"
+                    ),
+                    "usage": (
+                        "Pass athlete_id to any athlete-scoped tool to target that "
+                        "athlete. Omit it to use the default."
+                    ),
+                },
+                query_type="athlete_list",
+            )
+
+    except ICUAPIError as e:
+        return ResponseBuilder.build_error_response(
+            e.message,
+            error_type="api_error",
+            suggestions=[
+                "This endpoint requires an API key (not an OAuth bearer token).",
+                "Athletes appear here only after they accept your follow or coaching request.",
+                "Omit athlete_id on other tools to use the configured default athlete.",
+            ],
+        )
+    except Exception as e:
+        return ResponseBuilder.build_error_response(
+            f"Unexpected error: {str(e)}",
+            error_type="internal_error",
+        )
+
+
+async def get_athlete_profile(
+    athlete_id: Annotated[str | None, "Athlete ID (for coaches managing multiple athletes)"] = None,
+    ctx: Context | None = None,
+) -> str:
+    """Get an athlete's profile — sport settings (outdoor/indoor FTP, FTHR, pace) and current CTL/ATL/TSB.
+
+    Defaults to the authenticated athlete; coaches can pass athlete_id to read
+    one of their managed athletes instead.
+    """
+    assert ctx is not None
+    config: ICUConfig = await ctx.get_state("config")
+
+    try:
+        async with ICUClient(config) as client:
+            athlete = await client.get_athlete(athlete_id=athlete_id)
 
             # Build profile data
             profile: dict[str, Any] = {
@@ -174,11 +287,14 @@ async def get_athlete_profile(
 
 
 async def get_fitness_summary(
+    athlete_id: Annotated[str | None, "Athlete ID (for coaches managing multiple athletes)"] = None,
     ctx: Context | None = None,
 ) -> str:
-    """Get the athlete's current fitness / fatigue / form snapshot — CTL, ATL, TSB, ramp rate, with interpretation and training recommendations.
+    """Get an athlete's current fitness / fatigue / form snapshot — CTL, ATL, TSB, ramp rate, with interpretation and training recommendations.
 
     Use for "how's my form?", "am I overtrained?", training-status checks.
+    Defaults to the authenticated athlete; coaches can pass athlete_id to read
+    one of their managed athletes instead.
     """
     assert ctx is not None
     config: ICUConfig = await ctx.get_state("config")
@@ -186,7 +302,8 @@ async def get_fitness_summary(
     try:
         async with ICUClient(config) as client:
             today = date.today().isoformat()
-            wellness = await client.get_wellness_for_date(today)
+            resolved_athlete = athlete_id or config.intervals_icu_athlete_id
+            wellness = await client.get_wellness_for_date(today, athlete_id=athlete_id)
 
             ctl = wellness.ctl
             atl = wellness.atl
@@ -195,9 +312,12 @@ async def get_fitness_summary(
 
             if ctl is None and atl is None:
                 return ResponseBuilder.build_error_response(
-                    "No fitness data available. "
-                    "Complete some activities to build your fitness history.",
+                    f"No fitness data available for athlete {resolved_athlete} on {today}.",
                     error_type="no_data",
+                    suggestions=[
+                        "Fitness metrics need a training history — check that this "
+                        "athlete has activities recorded.",
+                    ],
                 )
 
             # Core metrics
@@ -295,6 +415,7 @@ async def get_fitness_summary(
                 analysis["recommendations"] = recommendations
 
             data: dict[str, Any] = {
+                "athlete_id": resolved_athlete,
                 "date": today,
                 "fitness_metrics": fitness,
             }
@@ -385,6 +506,7 @@ async def get_fitness_chart(
             if not series:
                 return ResponseBuilder.build_response(
                     data={
+                        "athlete_id": athlete_id or config.intervals_icu_athlete_id,
                         "date_range": {"oldest": oldest, "newest": newest},
                         "count": 0,
                         "series": [],
@@ -397,6 +519,7 @@ async def get_fitness_chart(
                 )
 
             data: dict[str, Any] = {
+                "athlete_id": athlete_id or config.intervals_icu_athlete_id,
                 "date_range": {"oldest": oldest, "newest": newest},
                 "count": len(series),
                 "series": series,
