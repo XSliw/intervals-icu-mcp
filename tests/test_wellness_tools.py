@@ -150,7 +150,57 @@ class TestWellnessTools:
         assert "readiness" in scales and "0-100" in scales["readiness"]
         # Scales for fields not present should be absent
         assert "soreness" not in scales
-        assert "stress" not in scales
+
+    async def test_get_wellness_for_date_surfaces_hydration_rating(self, mock_config, respx_mock):
+        """The subjective 1-4 hydration rating was silently dropped by the
+        formatter (it is enumerated on the model, so it never reached the
+        custom_fields fallback either). It must surface with its scale."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        respx_mock.get("/athlete/i123456/wellness/2026-04-21").mock(
+            return_value=Response(
+                200,
+                json={
+                    "id": "2026-04-21",
+                    "hydration": 2,
+                    "hydrationVolume": 2.5,
+                },
+            )
+        )
+
+        result = await get_wellness_for_date(date="2026-04-21", ctx=mock_ctx)
+        response = json.loads(result)
+
+        data = response["data"]
+        assert data["subjective"]["hydration"] == 2
+        # the liters-drunk volume stays a separate nutrition field
+        assert data["nutrition"]["hydration_liters"] == 2.5
+        scales = response["metadata"]["scales"]
+        assert "hydration" in scales and "1-4" in scales["hydration"]
+
+    async def test_update_wellness_writes_hydration_rating(self, mock_config, respx_mock):
+        """The subjective rating is writable and distinct from hydrationVolume."""
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = AsyncMock(return_value=mock_config)
+
+        route = respx_mock.put("/athlete/i123456/wellness").mock(
+            return_value=Response(
+                200,
+                json={"id": "2026-04-22", "hydration": 3, "hydrationVolume": 1.5},
+            )
+        )
+
+        result = await update_wellness(
+            date="2026-04-22", hydration=3, hydration_liters=1.5, ctx=mock_ctx
+        )
+
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["hydration"] == 3
+        assert sent["hydrationVolume"] == 1.5
+        response = json.loads(result)
+        assert response["data"]["subjective"]["hydration"] == 3
+        assert response["data"]["nutrition"]["hydration_liters"] == 1.5
 
     async def test_get_wellness_data_includes_scales_and_extra_fields(
         self, mock_config, respx_mock

@@ -12,7 +12,8 @@ from ..response_builder import ResponseBuilder
 # Scale labels for subjective metrics — surfaced in response metadata so LLM
 # clients that only see the JSON payload (not the tool docstring) can still
 # interpret the values correctly. Direction matters: sleep_quality is inverted
-# (1=Great, 5=Poor) while every other 1-5 metric is "higher = more".
+# (1=Great, 5=Poor) while every other 1-5 metric is "higher = more"; hydration
+# uses a 1-4 range in the same higher-is-worse direction.
 WELLNESS_SCALES: dict[str, str] = {
     "fatigue": "1-5 (1=very low, 5=very high)",
     "soreness": "1-5 (1=very low, 5=very high)",
@@ -20,6 +21,7 @@ WELLNESS_SCALES: dict[str, str] = {
     "mood": "1-5 (1=very poor, 5=very good)",
     "motivation": "1-5 (1=very low, 5=very high)",
     "injury": "1-5 (1=none, 5=severe)",
+    "hydration": "1-4 (1=well hydrated, 4=very dehydrated)",
     "sleep_quality": "1-5 (1=Great, 5=Poor — inverted scale)",
     "sleep_score": "0-100 (device-specific, higher is better)",
     "readiness": "0-100 (higher is better)",
@@ -58,7 +60,7 @@ def _format_wellness_record(record: Any, date_id: str) -> dict[str, Any]:
 
     # Subjective feelings
     subjective: dict[str, Any] = {}
-    for field in ["fatigue", "soreness", "stress", "mood", "motivation", "injury"]:
+    for field in ["fatigue", "soreness", "stress", "mood", "motivation", "injury", "hydration"]:
         if getattr(record, field, None):
             subjective[field] = getattr(record, field)
     if getattr(record, "readiness", None):
@@ -355,6 +357,9 @@ async def update_wellness(
     mood: Annotated[int | None, "Mood level (1-5 scale)"] = None,
     motivation: Annotated[int | None, "Motivation level (1-5 scale)"] = None,
     injury: Annotated[int | None, "Injury severity (1-5 scale: 1=none, 5=severe)"] = None,
+    hydration: Annotated[
+        int | None, "Subjective hydration rating (1-4: 1=well hydrated, 4=very dehydrated)"
+    ] = None,
     readiness: Annotated[float | None, "Readiness score (0-100)"] = None,
     body_fat: Annotated[float | None, "Body fat percentage"] = None,
     abdomen: Annotated[float | None, "Abdominal circumference in cm"] = None,
@@ -425,6 +430,8 @@ async def update_wellness(
             wellness_data["motivation"] = motivation
         if injury is not None:
             wellness_data["injury"] = injury
+        if hydration is not None:
+            wellness_data["hydration"] = hydration
         if readiness is not None:
             wellness_data["readiness"] = readiness
         if body_fat is not None:
