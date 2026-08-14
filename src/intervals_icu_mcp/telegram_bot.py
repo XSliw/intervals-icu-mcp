@@ -28,6 +28,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logging.getLogger("httpx" ).setLevel(logging.WARNING)
 
 # These tools do not change Intervals.icu data. New write support must be added
 # separately behind an explicit, one-time confirmation flow.
@@ -149,7 +150,6 @@ def _mcp_client() -> Client:
     transport = StreamableHttpTransport(
         url=settings.mcp_url,
         headers={"Authorization": f"Bearer {_make_mcp_token()}"},
-        timeout=settings.request_timeout_seconds,
     )
     return Client(transport, timeout=settings.request_timeout_seconds)
 
