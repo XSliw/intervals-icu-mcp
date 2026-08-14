@@ -315,10 +315,12 @@ async def _diagnose_integrations() -> str:
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         logger.warning("MCP diagnostic failed: status=%s", status)
-        if status in {401, 403}:
+        if status == 401:
             report.append(
-                "MCP: аутентификация отклонена. У сервисов MCP и Telegram должен быть один и тот же MCP_JWT_SECRET."
+                "MCP: HTTP 401 — JWT-секрет в сервисах MCP и Telegram не совпадает."
             )
+        elif status == 403:
+            report.append("MCP: HTTP 403 — JWT принят, но доступ к MCP отклонён сервером.")
         elif status == 404:
             report.append("MCP: не найден по MCP_URL. Проверьте путь /mcp.")
         else:
@@ -349,7 +351,7 @@ async def _diagnose_integrations() -> str:
             report.append(f"AgentRouter: HTTP-ошибка {status}.")
     except RuntimeError as exc:
         logger.warning("AgentRouter diagnostic failed: %s", exc)
-        report.append("AgentRouter: вернул ответ в неподдерживаемом формате. Проверьте API-адрес или модель.")
+        report.append(f"AgentRouter: {exc}.")
     except Exception as exc:
         logger.exception("AgentRouter diagnostic failed: %s", type(exc).__name__)
         report.append(f"AgentRouter: ошибка подключения ({type(exc).__name__}).")
