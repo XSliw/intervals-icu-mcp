@@ -208,6 +208,12 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
     }
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
         response = await client.post(settings.agentrouter_chat_url, headers=headers, json=payload)
+        if response.is_error:
+            logger.warning(
+                "AgentRouter request failed: status=%s model=%s",
+                response.status_code,
+                settings.agentrouter_model,
+            )
         response.raise_for_status()
         body = response.json()
     choices = body.get("choices") or []
@@ -267,6 +273,45 @@ async def _answer_user(user_id: int, user_text: str) -> str:
     return "Не удалось завершить анализ за допустимое число шагов. Попробуйте задать более узкий вопрос."
 
 
+async def _diagnose_integrations() -> str:
+    """Test MCP and AgentRouter connectivity without exposing credentials."""
+
+    report: list[str] = []
+    try:
+        async with _mcp_client() as mcp_client:
+            tools = await mcp_client.list_tools()
+        allowed_count = sum(tool.name in READ_ONLY_TOOLS for tool in tools)
+        report.append(f"MCP: подключён, доступно инструментов только для чтения: {allowed_count}.")
+    except Exception as exc:
+        logger.exception("MCP diagnostic failed: %s", type(exc).__name__)
+        report.append(f"MCP: ошибка подключения ({type(exc).__name__}).")
+
+    try:
+        response = await _call_agentrouter(
+            [
+                {"role": "system", "content": "Reply with exactly OK."},
+                {"role": "user", "content": "Connection check"},
+            ],
+            [],
+        )
+        report.append(f"AgentRouter: подключён, ответ: {_message_content(response)[:60]}.")
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        logger.warning("AgentRouter diagnostic failed: status=%s", status)
+        if status in {401, 403}:
+            report.append("AgentRouter: ключ отклонён или не имеет доступа к выбранной модели.")
+        elif status == 404:
+            report.append("AgentRouter: не найден API-адрес или выбранная модель.")
+        elif status == 400:
+            report.append("AgentRouter: отклонил параметры или идентификатор модели.")
+        else:
+            report.append(f"AgentRouter: HTTP-ошибка {status}.")
+    except Exception as exc:
+        logger.exception("AgentRouter diagnostic failed: %s", type(exc).__name__)
+        report.append(f"AgentRouter: ошибка подключения ({type(exc).__name__}).")
+    return "\n".join(report)
+
+
 async def _telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/{method}"
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
@@ -306,8 +351,15 @@ async def _handle_message(message: dict[str, Any]) -> None:
         await _send_text(
             chat_id,
             "Я Sliwai Coach. Могу анализировать ваши активности, CTL/ATL/TSB, wellness и план тренировок. "
-            "Сейчас работаю в режиме только чтение: предложу план, но ничего не изменю в Intervals.icu.",
+            "Сейчас работаю в режиме только чтение: предложу план, но ничего не изменю в Intervals.icu. "
+            "Команда /diagnose безопасно проверит подключения без вывода секретов.",
         )
+        return
+
+    if cleaned == "/diagnose":
+        async with user_locks[user_id]:
+            await _telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+            await _send_text(chat_id, await _diagnose_integrations())
         return
 
     async with user_locks[user_id]:
@@ -315,8 +367,16 @@ async def _handle_message(message: dict[str, Any]) -> None:
             await _telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
             answer = await _answer_user(user_id, cleaned)
         except httpx.HTTPStatusError as exc:
-            logger.warning("Upstream HTTP error: %s", exc.response.status_code)
-            answer = "Сервис временно вернул ошибку. Попробуйте ещё раз через минуту."
+            status = exc.response.status_code
+            logger.warning("Upstream HTTP error: status=%s", status)
+            if status in {401, 403}:
+                answer = "AgentRouter отклонил ключ или доступ к модели. Отправьте /diagnose."
+            elif status == 404:
+                answer = "AgentRouter не нашёл API-адрес или модель. Отправьте /diagnose."
+            elif status == 400:
+                answer = "AgentRouter отклонил параметры или ID модели. Отправьте /diagnose."
+            else:
+                answer = f"Внешний сервис вернул HTTP {status}. Отправьте /diagnose."
         except Exception as exc:
             logger.exception("Unexpected Telegram bot error: %s", type(exc).__name__)
             answer = "Не удалось обработать запрос. Попробуйте ещё раз чуть позже."
