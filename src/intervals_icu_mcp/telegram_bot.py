@@ -240,6 +240,15 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        # Establish any cookie-based server session before the model request.
+        # The response itself is not used; normal API authentication still applies.
+        try:
+            await client.get(
+                f"{settings.agentrouter_base_url.rstrip('/')}/models",
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            logger.info("AgentRouter session warm-up unavailable: %s", type(exc).__name__)
         response = await client.post(settings.agentrouter_chat_url, headers=headers, json=payload)
         if response.is_error:
             logger.warning(
