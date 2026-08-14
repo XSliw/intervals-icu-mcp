@@ -90,9 +90,8 @@ class Settings(BaseSettings):
     allowed_telegram_user_ids: str = Field(min_length=1)
 
     agentrouter_api_key: str
-    # The co endpoint is the provider's OpenAI-compatible route that returns
-    # JSON from cloud deployments; AGENTROUTER_BASE_URL can override it.
-    agentrouter_base_url: str = "https://co.agentrouter.org/v1"
+    # Keys from agentrouter.org/console/token use the documented OpenAI-compatible route.
+    agentrouter_base_url: str = "https://agentrouter.org/v1"
     agentrouter_model: str
     agentrouter_user_agent: str = "SliwaiCoach-Telegram/1.0"
 
