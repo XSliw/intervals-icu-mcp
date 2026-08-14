@@ -138,6 +138,8 @@ def _make_mcp_token() -> str:
             "iss": settings.mcp_jwt_issuer,
             "aud": settings.mcp_jwt_audience,
             "sub": "telegram-bot-service",
+            "client_id": "telegram-bot-service",
+            "scope": "mcp:read",
             "iat": now,
             "exp": now + timedelta(minutes=5),
         },
@@ -199,6 +201,7 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
+        "stream": False,
         "temperature": 0.25,
         "max_tokens": 1_200,
     }
@@ -282,6 +285,17 @@ async def _diagnose_integrations() -> str:
             tools = await mcp_client.list_tools()
         allowed_count = sum(tool.name in READ_ONLY_TOOLS for tool in tools)
         report.append(f"MCP: подключён, доступно инструментов только для чтения: {allowed_count}.")
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        logger.warning("MCP diagnostic failed: status=%s", status)
+        if status in {401, 403}:
+            report.append(
+                "MCP: аутентификация отклонена. У сервисов MCP и Telegram должен быть один и тот же MCP_JWT_SECRET."
+            )
+        elif status == 404:
+            report.append("MCP: не найден по MCP_URL. Проверьте путь /mcp.")
+        else:
+            report.append(f"MCP: HTTP-ошибка {status}.")
     except Exception as exc:
         logger.exception("MCP diagnostic failed: %s", type(exc).__name__)
         report.append(f"MCP: ошибка подключения ({type(exc).__name__}).")
