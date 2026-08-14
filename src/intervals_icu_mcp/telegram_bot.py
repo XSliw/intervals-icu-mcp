@@ -346,6 +346,7 @@ async def _configure_webhook() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    logging.getLogger("httpx" ).disabled = True
     await _configure_webhook()
     yield
 
