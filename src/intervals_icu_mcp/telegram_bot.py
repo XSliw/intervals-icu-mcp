@@ -9,7 +9,9 @@ session or an ambiguous prompt from modifying training data.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
+import io
 import json
 import logging
 import os
@@ -25,6 +27,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
@@ -77,7 +80,17 @@ updated, deleted, or scheduled anything in Intervals.icu. You may propose a
 workout or calendar change as a draft, but must clearly say it is only a draft.
 Do not diagnose medical conditions. When a user reports pain, illness, injury,
 or unusual symptoms, recommend appropriate professional medical advice rather
-than making a diagnosis. Be transparent when data is unavailable."""
+than making a diagnosis. Be transparent when data is unavailable.
+
+For running plans, use an evidence-informed approach: clarify event, time horizon,
+current volume, intensity distribution, recent load, recovery, wellness, sleep,
+and injury constraints. Use easy aerobic work as the base, add threshold, VO2max,
+speed, hills, strength, and recovery according to the goal and phase. Do not promise
+maximum results in minimum time; explain trade-offs and stop/adjust for red flags.
+A proposed workout or calendar change is always a draft until the user confirms.
+For images, inspect visible text, charts, tables, pace/HR/power and dates, state
+what is uncertain, and never invent unreadable values. For PDFs, distinguish
+extracted text from interpretation and ask for a page screenshot when needed."""
 
 
 class Settings(BaseSettings):
@@ -104,6 +117,7 @@ class Settings(BaseSettings):
     auto_set_webhook: bool = False
     request_timeout_seconds: float = 45.0
     conversation_max_messages: int = Field(default=12, ge=2, le=30)
+    max_attachment_bytes: int = Field(default=10_000_000, ge=100_000, le=20_000_000)
 
     @property
     def allowed_user_ids(self) -> set[int]:
@@ -267,7 +281,58 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
     return message
 
 
-async def _answer_user(user_id: int, user_text: str) -> str:
+async def _download_telegram_file(file_id: str) -> bytes:
+    """Download one bounded Telegram attachment into memory only."""
+
+    body = await _telegram_api("getFile", {"file_id": file_id})
+    file_path = ((body.get("result") or {}).get("file_path"))
+    if not isinstance(file_path, str) or not file_path:
+        raise RuntimeError("Telegram did not return a file path")
+    url = f"https://api.telegram.org/file/bot{settings.telegram_bot_token}/{file_path}"
+    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+    if len(response.content) > settings.max_attachment_bytes:
+        raise ValueError("Вложение слишком большое для безопасного анализа")
+    return response.content
+
+
+async def _prepare_attachment(message: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]] | None]:
+    """Return text context or an OpenAI-compatible image part; never persist the file."""
+
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos and all(isinstance(item, dict) for item in photos):
+        photo = max(photos, key=lambda item: int(item.get("width", 0)) * int(item.get("height", 0)))
+        file_id = photo.get("file_id")
+        if isinstance(file_id, str):
+            raw = await _download_telegram_file(file_id)
+            encoded = base64.b64encode(raw).decode("ascii")
+            return None, [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}}]
+
+    document = message.get("document")
+    if isinstance(document, dict):
+        file_name = str(document.get("file_name") or "").lower()
+        mime_type = str(document.get("mime_type") or "").lower()
+        if mime_type == "application/pdf" or file_name.endswith(".pdf"):
+            file_id = document.get("file_id")
+            if not isinstance(file_id, str):
+                raise ValueError("Не найден идентификатор PDF-файла")
+            raw = await _download_telegram_file(file_id)
+            reader = PdfReader(io.BytesIO(raw))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+            if not text:
+                return "PDF не содержит извлекаемого текста. Пришлите скриншот нужной страницы.", None
+            return f"Текст из PDF (может быть неполным):\\n{text[:30_000]}", None
+        return "Поддерживаются только изображения и PDF-файлы.", None
+
+    return None, None
+
+
+async def _answer_user(
+    user_id: int,
+    user_content: str | list[dict[str, Any]],
+    history_user_text: str,
+) -> str:
     """Run a bounded, read-only tool-calling loop for one Telegram message."""
 
     async with _mcp_client() as mcp_client:
@@ -275,7 +340,7 @@ async def _answer_user(user_id: int, user_text: str) -> str:
         openai_tools = [_as_openai_tool(tool) for tool in mcp_tools if tool.name in READ_ONLY_TOOLS]
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(conversation_history[user_id])
-        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": user_content})
 
         for _ in range(4):
             assistant_message = await _call_agentrouter(messages, openai_tools)
@@ -283,7 +348,7 @@ async def _answer_user(user_id: int, user_text: str) -> str:
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
                 answer = _message_content(assistant_message)
-                conversation_history[user_id].append({"role": "user", "content": user_text})
+                conversation_history[user_id].append({"role": "user", "content": history_user_text})
                 conversation_history[user_id].append({"role": "assistant", "content": answer})
                 _trim_history(user_id)
                 return answer
@@ -394,17 +459,20 @@ async def _handle_message(message: dict[str, Any]) -> None:
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     text = message.get("text")
+    caption = message.get("caption")
 
     if not isinstance(user_id, int) or not isinstance(chat_id, int):
         return
     if user_id not in settings.allowed_user_ids:
         logger.warning("Rejected Telegram message from unauthorized user_id=%s", user_id)
         return
-    if not isinstance(text, str) or not text.strip():
-        await _send_text(chat_id, "Пожалуйста, отправьте текстовый вопрос о тренировках или данных Intervals.icu.")
-        return
-
+    if not isinstance(text, str):
+        text = caption if isinstance(caption, str) else ""
     cleaned = text.strip()
+    has_attachment = isinstance(message.get("photo"), list) or isinstance(message.get("document"), dict)
+    if not cleaned and not has_attachment:
+        await _send_text(chat_id, "Пожалуйста, отправьте текстовый вопрос, изображение или PDF.")
+        return
     if cleaned in {"/start", "/help"}:
         await _send_text(
             chat_id,
@@ -423,7 +491,13 @@ async def _handle_message(message: dict[str, Any]) -> None:
     async with user_locks[user_id]:
         try:
             await _telegram_api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
-            answer = await _answer_user(user_id, cleaned)
+            attachment_text, image_parts = await _prepare_attachment(message)
+            if attachment_text:
+                cleaned = f"{cleaned}\n\n{attachment_text}".strip()
+            user_content: str | list[dict[str, Any]] = cleaned
+            if image_parts:
+                user_content = [{"type": "text", "text": cleaned or "Проанализируй это изображение."}, *image_parts]
+            answer = await _answer_user(user_id, user_content, cleaned or "Пользователь приложил файл")
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             logger.warning("Upstream HTTP error: status=%s", status)

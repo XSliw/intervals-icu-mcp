@@ -65,3 +65,26 @@ def test_webhook_rejects_wrong_secret(telegram_bot: object) -> None:
             json={"update_id": 1},
         )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_photo_is_converted_to_ephemeral_data_url(telegram_bot: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_download(_: str) -> bytes:
+        return b"fake-image-bytes"
+
+    monkeypatch.setattr(telegram_bot, "_download_telegram_file", fake_download)
+    text_context, image_parts = await telegram_bot._prepare_attachment(
+        {"photo": [{"file_id": "photo-id", "width": 100, "height": 100}]}
+    )
+    assert text_context is None
+    assert image_parts and image_parts[0]["type"] == "image_url"
+    assert "base64," in image_parts[0]["image_url"]["url"]
+
+
+@pytest.mark.asyncio
+async def test_non_pdf_documents_are_rejected(telegram_bot: object) -> None:
+    text_context, image_parts = await telegram_bot._prepare_attachment(
+        {"document": {"file_id": "doc-id", "file_name": "notes.txt", "mime_type": "text/plain"}}
+    )
+    assert text_context == "Поддерживаются только изображения и PDF-файлы."
+    assert image_parts is None
