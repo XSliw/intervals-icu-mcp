@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     agentrouter_api_key: str
     agentrouter_base_url: str = "https://agentrouter.org/v1"
     agentrouter_model: str
+    agentrouter_user_agent: str = "SliwaiCoach-Telegram/1.0"
 
     mcp_url: str
     mcp_jwt_secret: str = Field(min_length=32)
@@ -233,6 +234,7 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
     }
     headers = {
         "Authorization": f"Bearer {settings.agentrouter_api_key}",
+        "User-Agent": settings.agentrouter_user_agent,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
