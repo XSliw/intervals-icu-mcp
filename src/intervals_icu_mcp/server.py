@@ -1,17 +1,38 @@
 """Intervals.icu MCP Server - FastMCP entry point."""
 
 import argparse
+import os
 import sys
 from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 
 # Load environment variables
 load_dotenv()
 
+def _build_http_auth() -> JWTVerifier | None:
+    """Build JWT verification only when a server-side secret is configured.
+
+    The HTTP entry point fails closed below when the secret is missing. Keeping
+    this optional here preserves the original local STDIO use case, where the
+    operating-system process boundary provides the access control.
+    """
+
+    secret = os.getenv("MCP_JWT_SECRET")
+    if not secret:
+        return None
+    return JWTVerifier(
+        public_key=secret,
+        issuer=os.getenv("MCP_JWT_ISSUER", "telegram-intervals-bot"),
+        audience=os.getenv("MCP_JWT_AUDIENCE", "intervals-icu-mcp"),
+        algorithm="HS256",
+    )
+
+
 # Initialize FastMCP server
-mcp = FastMCP("intervals_icu_mcp")
+mcp = FastMCP("intervals_icu_mcp", auth=_build_http_auth())
 
 # Register middleware
 from .auth import load_config
@@ -1156,6 +1177,12 @@ def main() -> None:
     if args.transport == "stdio":
         mcp.run()
         return
+
+    if not os.getenv("MCP_JWT_SECRET"):
+        raise SystemExit(
+            "MCP_JWT_SECRET must be set before exposing Intervals.icu over HTTP. "
+            "Use a random secret of at least 32 characters."
+        )
 
     kwargs: dict[str, Any] = {"host": args.host, "port": args.port}
     if args.path is not None:
