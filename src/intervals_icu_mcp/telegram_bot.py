@@ -189,6 +189,32 @@ def _message_content(message: dict[str, Any]) -> str:
     return "Не получил текстового ответа от модели. Попробуйте сформулировать вопрос иначе."
 
 
+def _parse_agentrouter_body(response: httpx.Response) -> dict[str, Any]:
+    """Parse a normal JSON response or a single event-stream JSON payload."""
+
+    raw = response.text.strip()
+    if not raw:
+        raise RuntimeError("AgentRouter returned an empty response")
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        event_payloads = [
+            line.removeprefix("data:").strip()
+            for line in raw.splitlines()
+            if line.startswith("data:") and line.removeprefix("data:").strip() != "[DONE]"
+        ]
+        if not event_payloads:
+            content_type = response.headers.get("content-type", "unknown")
+            raise RuntimeError(f"AgentRouter returned non-JSON content ({content_type})") from None
+        try:
+            body = json.loads(event_payloads[-1])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("AgentRouter returned an invalid event-stream payload") from exc
+    if not isinstance(body, dict):
+        raise RuntimeError("AgentRouter returned a non-object JSON response")
+    return body
+
+
 def _trim_history(user_id: int) -> None:
     history = conversation_history[user_id]
     while len(history) > settings.conversation_max_messages:
@@ -207,6 +233,7 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
     }
     headers = {
         "Authorization": f"Bearer {settings.agentrouter_api_key}",
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
@@ -218,7 +245,7 @@ async def _call_agentrouter(messages: list[dict[str, Any]], tools: list[dict[str
                 settings.agentrouter_model,
             )
         response.raise_for_status()
-        body = response.json()
+        body = _parse_agentrouter_body(response)
     choices = body.get("choices") or []
     if not choices or not isinstance(choices[0], dict):
         raise RuntimeError("AgentRouter returned no choices")
@@ -320,6 +347,9 @@ async def _diagnose_integrations() -> str:
             report.append("AgentRouter: отклонил параметры или идентификатор модели.")
         else:
             report.append(f"AgentRouter: HTTP-ошибка {status}.")
+    except RuntimeError as exc:
+        logger.warning("AgentRouter diagnostic failed: %s", exc)
+        report.append("AgentRouter: вернул ответ в неподдерживаемом формате. Проверьте API-адрес или модель.")
     except Exception as exc:
         logger.exception("AgentRouter diagnostic failed: %s", type(exc).__name__)
         report.append(f"AgentRouter: ошибка подключения ({type(exc).__name__}).")
