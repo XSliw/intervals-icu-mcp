@@ -15,7 +15,7 @@ class TestParseArgs:
         assert args.transport == "stdio"
         assert args.host == "127.0.0.1"
         assert args.port == 8000
-        assert args.path is None
+        assert args.path == "/mcp"
 
     def test_http_with_custom_host_and_port(self):
         args = _parse_args(["--transport", "http", "--host", "0.0.0.0", "--port", "9000"])

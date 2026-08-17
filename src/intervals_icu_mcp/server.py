@@ -1,7 +1,6 @@
 """Intervals.icu MCP Server - FastMCP entry point."""
 
 import argparse
-import os
 import sys
 from typing import Any
 
@@ -1129,8 +1128,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--path",
-        default=None,
-        help="URL path to mount the server under (HTTP transports only).",
+        default="/mcp",
+        help="URL path to mount the server under (HTTP transports only). Default: /mcp.",
     )
     return parser.parse_args(argv)
 
@@ -1160,12 +1159,6 @@ def main() -> None:
     if args.transport == "stdio":
         mcp.run()
         return
-
-    if not os.getenv("MCP_JWT_SECRET"):
-        raise SystemExit(
-            "MCP_JWT_SECRET must be set before exposing Intervals.icu over HTTP. "
-            "Use a random secret of at least 32 characters."
-        )
 
     kwargs: dict[str, Any] = {"host": args.host, "port": args.port}
     if args.path is not None:
