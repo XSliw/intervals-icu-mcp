@@ -7,37 +7,20 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.jwt import JWTVerifier
 
 # Load environment variables
 load_dotenv()
 
-def _build_http_auth() -> JWTVerifier | None:
-    """Build JWT verification only when a server-side secret is configured.
-
-    The HTTP entry point fails closed below when the secret is missing. Keeping
-    this optional here preserves the original local STDIO use case, where the
-    operating-system process boundary provides the access control.
-    """
-
-    secret = os.getenv("MCP_JWT_SECRET")
-    if not secret:
-        return None
-    return JWTVerifier(
-        public_key=secret,
-        issuer=os.getenv("MCP_JWT_ISSUER", "telegram-intervals-bot"),
-        audience=os.getenv("MCP_JWT_AUDIENCE", "intervals-icu-mcp"),
-        algorithm="HS256",
-    )
-
-
-# Initialize FastMCP server
-mcp = FastMCP("intervals_icu_mcp", auth=_build_http_auth())
+# The owner explicitly elected public HTTP access for this deployment. HTTP
+# callers do not need JWT credentials, but PublicReadOnlyMiddleware below blocks
+# every mutating tool. Local STDIO clients keep their existing full tool surface.
+mcp = FastMCP("intervals_icu_mcp")
 
 # Register middleware
 from .auth import load_config
-from .middleware import ConfigMiddleware
+from .middleware import ConfigMiddleware, PublicReadOnlyMiddleware
 
+mcp.add_middleware(PublicReadOnlyMiddleware())
 mcp.add_middleware(ConfigMiddleware())
 
 # Read delete mode at startup. This decides which destructive tools are

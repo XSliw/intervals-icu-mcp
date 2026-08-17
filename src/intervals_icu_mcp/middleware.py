@@ -11,6 +11,25 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from .auth import load_config, validate_credentials
 
+PUBLIC_READ_ONLY_PREFIXES = ("icu_get_", "icu_list_", "icu_search_", "icu_download_")
+
+
+class PublicReadOnlyMiddleware(Middleware):
+    """Deny every mutating tool call when the MCP is exposed over HTTP.
+
+    Public HTTP access deliberately permits data retrieval only. Local STDIO
+    clients retain the existing configuration and tool surface.
+    """
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next: Callable[..., Any]):
+        from fastmcp.server.context import _current_transport
+
+        if _current_transport.get() != "stdio" and not context.message.name.startswith(
+            PUBLIC_READ_ONLY_PREFIXES
+        ):
+            raise ToolError("Public HTTP MCP permits read-only tools only.")
+        return await call_next(context)
+
 
 class ConfigMiddleware(Middleware):
     """Middleware that loads and validates Intervals.icu configuration for all tool calls.

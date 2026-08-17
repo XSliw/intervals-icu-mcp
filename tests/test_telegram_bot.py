@@ -6,7 +6,6 @@ import importlib
 import sys
 from collections.abc import Iterator
 
-import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -22,7 +21,6 @@ def telegram_bot(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
         "AGENTROUTER_API_KEY": "agentrouter-test-key",
         "AGENTROUTER_MODEL": "test-model",
         "MCP_URL": "https://mcp.example.test/mcp",
-        "MCP_JWT_SECRET": "mcp-jwt-secret-for-tests-only-must-be-long",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -37,16 +35,8 @@ def test_allowed_ids_are_parsed(telegram_bot: object) -> None:
     assert telegram_bot.settings.allowed_user_ids == {12345, 67890}
 
 
-def test_mcp_service_token_has_expected_claims(telegram_bot: object) -> None:
-    token = telegram_bot._make_mcp_token()
-    claims = jwt.decode(
-        token,
-        telegram_bot.settings.mcp_jwt_secret,
-        algorithms=["HS256"],
-        issuer="telegram-intervals-bot",
-        audience="intervals-icu-mcp",
-    )
-    assert claims["sub"] == "telegram-bot-service"
+def test_public_mcp_client_requires_no_jwt_setting(telegram_bot: object) -> None:
+    assert not hasattr(telegram_bot.settings, "mcp_jwt_secret")
 
 
 def test_only_read_tools_are_exposed(telegram_bot: object) -> None:

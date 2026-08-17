@@ -17,11 +17,9 @@ import logging
 import os
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-import jwt
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
@@ -109,9 +107,7 @@ class Settings(BaseSettings):
     agentrouter_user_agent: str = "SliwaiCoach-Telegram/1.0"
 
     mcp_url: str
-    mcp_jwt_secret: str = Field(min_length=32)
-    mcp_jwt_issuer: str = "telegram-intervals-bot"
-    mcp_jwt_audience: str = "intervals-icu-mcp"
+    # Public MCP deployments do not require a client-side JWT secret.
 
     public_base_url: str | None = None
     auto_set_webhook: bool = False
@@ -145,30 +141,8 @@ user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 recent_update_ids: deque[int] = deque(maxlen=1_000)
 
 
-def _make_mcp_token() -> str:
-    """Issue a short-lived service token used only between the bot and MCP."""
-
-    now = datetime.now(UTC)
-    return jwt.encode(
-        {
-            "iss": settings.mcp_jwt_issuer,
-            "aud": settings.mcp_jwt_audience,
-            "sub": "telegram-bot-service",
-            "client_id": "telegram-bot-service",
-            "scope": "mcp:read",
-            "iat": now,
-            "exp": now + timedelta(minutes=5),
-        },
-        settings.mcp_jwt_secret,
-        algorithm="HS256",
-    )
-
-
 def _mcp_client() -> Client:
-    transport = StreamableHttpTransport(
-        url=settings.mcp_url,
-        headers={"Authorization": f"Bearer {_make_mcp_token()}"},
-    )
+    transport = StreamableHttpTransport(url=settings.mcp_url)
     return Client(transport, timeout=settings.request_timeout_seconds)
 
 
@@ -394,7 +368,7 @@ async def _diagnose_integrations() -> str:
         logger.warning("MCP diagnostic failed: status=%s", status)
         if status == 401:
             report.append(
-                "MCP: HTTP 401 — JWT-секрет в сервисах MCP и Telegram не совпадает."
+                "MCP: HTTP 401 — публичный MCP всё ещё требует авторизацию; проверьте его deploy."
             )
         elif status == 403:
             report.append("MCP: HTTP 403 — JWT принят, но доступ к MCP отклонён сервером.")
